@@ -1,0 +1,167 @@
+version: "3.9"
+x-restart-policy: &restart_policy
+  restart: unless-stopped
+
+x-project-defaults: &project_defaults
+  <<: *restart_policy
+  networks:
+    - public
+  # extra_hosts:
+  #   - host.docker.internal:host-gateway
+  #   - data.local:host-gateway
+  #   - orchestration.data.local:host-gateway
+  env_file: ./.env
+services:
+  reverse-proxy:
+    <<: *project_defaults
+    image: ${TRAEFIK_IMAGE}
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      # - "/etc/traefik:/etc/traefik"
+      # - "traefik-ssl-certs:/ssl-certs"
+    # healthcheck:
+    #   test: ["CMD", "traefik", "healthcheck", "--ping"]
+    #   interval: 10s
+    #   timeout: 5s
+    #   retries: 3
+    #   start_period: 5s
+    command:
+      - "--ping"
+      - "--api.insecure=true"
+      - "--providers.docker"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - --entrypoints.websecure.address=:443
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    # This service runs the postgres DB used by dagster for run storage, schedule storage,
+  # and event log storage.
+  postgres:
+    <<: *project_defaults
+    image: postgres:11
+    container_name: postgresql
+
+  # This service runs the gRPC server that loads your user code, in both dagit
+  # and dagster-daemon. By setting DAGSTER_CURRENT_IMAGE to its own image, we tell the
+  # run launcher to use this same image when launching runs in a new container as well.
+  # Multiple containers like this can be deployed separately - each just needs to run on
+  # its own port, and have its own entry in the workspace.yaml file that's loaded by dagit.
+  dagster_multi_user_code:
+    <<: *project_defaults
+    build:
+      context: ./dagster_multi
+      dockerfile: Dockerfile_user_code
+    container_name: user_code
+    image: user_code_image
+    environment:
+      - DAGSTER_CURRENT_IMAGE=user_code_image
+
+  dagster_multi_tutorial:
+    <<: *project_defaults
+    build:
+      context: ./dagster-tutorial
+      dockerfile: Dockerfile
+    container_name: dagster_multi_tutorial
+    image: dagster_multi_tutorial_image
+    environment:
+      - DAGSTER_CURRENT_IMAGE=dagster_multi_tutorial_image
+
+  # This service runs dagit, which loads your user code from the user code container.
+  # Since our instance uses the QueuedRunCoordinator, any runs submitted from dagit will be put on
+  # a queue and later dequeued and launched by dagster-daemon.
+  dagster_multi_dagit:
+    <<: *project_defaults
+    build:
+      context: ./dagster_multi
+      dockerfile: Dockerfile_dagster
+    entrypoint:
+      - dagit
+      - -h
+      - "0.0.0.0"
+      - -p
+      - "3000"
+      - -w
+      - workspace.yaml
+    container_name: dagster_multi_dagit
+    ports:
+      - "3030:3000"
+    volumes: # Make docker client accessible so we can terminate containers from dagit
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/io_manager_storage:/tmp/io_manager_storage
+    depends_on:
+      - postgres
+      - dagster_multi_user_code
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dagster-multi.rule=Host(`orchestrator.localhost`)"
+      - "traefik.http.routers.dagster-multi.entrypoints=web"
+
+  # This service runs the dagster-daemon process, which is responsible for taking runs
+  # off of the queue and launching them, as well as creating runs from schedules or sensors.
+  daemon:
+    <<: *project_defaults
+    build:
+      context: ./dagster_multi
+      dockerfile: Dockerfile_dagster
+    entrypoint:
+      - dagster-daemon
+      - run
+    container_name: daemon
+    volumes: # Make docker client accessible so we can launch containers using host docker
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/io_manager_storage:/tmp/io_manager_storage
+    depends_on:
+      - postgres
+      - dagster_multi_user_code
+      - dagster_multi_tutorial
+
+  metaduck:
+    <<: *project_defaults
+    build:
+      context: ./metaduck
+      dockerfile: Dockerfile
+    depends_on:
+      - reverse-proxy
+    ports:
+      - "3333:3000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.metaduck.rule=Host(`bi.localhost`)"
+    volumes:
+      - "../data/nogit/duckdb:/container/directory"
+
+  storage:
+    <<: *project_defaults
+    image: minio/minio:RELEASE.2022-07-08T00-05-23Z
+    entrypoint:
+      - /bin/sh
+    command:
+      - -c
+      - mkdir -p /data/default && /opt/bin/minio server --address :9000  --console-address :9001 /data
+    restart: always
+    ports:
+      - "9001:9001"
+    volumes:
+      - "../data/nogit/minio:/data"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.storage.rule=Host(`storage.localhost`)"
+
+  # whoami:
+  #   # A container that exposes an API to show its IP address
+  #   image: traefik/whoami
+  #   labels:
+  #     - "traefik.enable=true"
+  #     - "traefik.http.routers.whoami.rule=Host(`whoami.localhost`)"
+  #     - "traefik.http.routers.whoami.entrypoints=web"
+
+volumes:
+  traefik-ssl-certs:
+    driver: local
+
+networks:
+  public:
+    driver: bridge
+    name: public
